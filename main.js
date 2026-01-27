@@ -1,4 +1,3 @@
-import { fetch } from "undici";
 import readline from "node:readline";
 import { decompress } from "fzstd";
 
