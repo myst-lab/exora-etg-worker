@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
     "start": "node main.js"
   },
   "dependencies": {
-    "@mongodb-js/zstd": "^2.0.2"
-  },
-  "engines": {
-    "node": ">=18"
+    "@mongodb-js/zstd": "^7.0.0"
   }
 }
