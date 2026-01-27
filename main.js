@@ -1,7 +1,8 @@
 import readline from "node:readline";
-import { Readable } from "node:stream";
-import { Transform } from "node:stream";
-import { createDecompressStream } from "@mongodb-js/zstd";
+import { Readable, Transform } from "node:stream";
+import zstdPkg from "@mongodb-js/zstd";
+
+const { createDecompressStream } = zstdPkg;
 
 function must(name) {
   const v = process.env[name];
@@ -9,7 +10,6 @@ function must(name) {
   return v;
 }
 
-// Required env
 const ETG_GATEWAY_URL = must("ETG_GATEWAY_URL");
 const ETG_GATEWAY_TOKEN = must("ETG_GATEWAY_TOKEN");
 const ETG_TARGET = must("ETG_TARGET");
@@ -18,9 +18,8 @@ const ETG_LANGUAGE = must("ETG_LANGUAGE");
 const ETG_INVENTORY = must("ETG_INVENTORY");
 
 const SUPABASE_UPSERT_URL = must("SUPABASE_UPSERT_URL");
-
-// Optional env
 const SYNC_API_TOKEN = process.env.SYNC_API_TOKEN || "";
+
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
 
@@ -78,7 +77,7 @@ async function upsertBatch(download_id, hotels, batch_index) {
   return json;
 }
 
-// Checks first bytes for ZSTD frame magic: 28 B5 2F FD
+// ZSTD magic: 28 B5 2F FD
 function zstdMagicGuard() {
   let checked = false;
 
@@ -87,16 +86,9 @@ function zstdMagicGuard() {
       if (!checked) {
         checked = true;
         const b = chunk instanceof Buffer ? chunk : Buffer.from(chunk);
-        const hex = b.subarray(0, 8).toString("hex");
-        const magic = b.subarray(0, 4).toString("hex"); // expect 28b52ffd
-
+        const magic = b.subarray(0, 4).toString("hex");
         if (magic !== "28b52ffd") {
-          cb(
-            new Error(
-              `Downloaded data is NOT raw .zst (magic=${magic}, first8=${hex}). ` +
-              `This usually means the URL returned HTML/JSON error OR HTTP compression changed the bytes.`
-            )
-          );
+          cb(new Error(`Not raw .zst bytes (magic=${magic}). Dump URL likely returned HTML/JSON or got altered.`));
           return;
         }
       }
@@ -116,20 +108,16 @@ async function run() {
 
   console.log("⬇️ Downloading dump (.zst)...");
   const dumpRes = await fetch(dumpUrl, {
-    // CRITICAL: ensure we get the raw bytes, not gzip/br-decoded content
     headers: { "Accept-Encoding": "identity" }
   });
 
   if (!dumpRes.ok) {
-    const t = await dumpRes.text();
-    throw new Error(`Dump download failed (${dumpRes.status}): ${t}`);
+    throw new Error(`Dump download failed (${dumpRes.status}): ${await dumpRes.text()}`);
   }
   if (!dumpRes.body) throw new Error("Dump response has no body stream");
 
-  // Convert Web ReadableStream -> Node Readable
-  const nodeBody = Readable.fromWeb(dumpRes.body);
-
   console.log("🔓 Decompressing ZSTD (streaming)...");
+  const nodeBody = Readable.fromWeb(dumpRes.body);
   const decompressedStream = nodeBody
     .pipe(zstdMagicGuard())
     .pipe(createDecompressStream());
