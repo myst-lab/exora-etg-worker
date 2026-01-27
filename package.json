@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20 <26"
+  },
   "scripts": {
     "start": "node main.js"
   },
   "dependencies": {
-    "@mongodb-js/zstd": "^7.0.0"
+    "zstd-napi": "^0.0.12"
   }
 }
