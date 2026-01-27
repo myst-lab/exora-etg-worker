@@ -1,5 +1,6 @@
 import readline from "node:readline";
 import { Readable } from "node:stream";
+import { Transform } from "node:stream";
 import { createDecompressStream } from "@mongodb-js/zstd";
 
 function must(name) {
@@ -8,6 +9,7 @@ function must(name) {
   return v;
 }
 
+// Required env
 const ETG_GATEWAY_URL = must("ETG_GATEWAY_URL");
 const ETG_GATEWAY_TOKEN = must("ETG_GATEWAY_TOKEN");
 const ETG_TARGET = must("ETG_TARGET");
@@ -15,21 +17,15 @@ const ETG_DUMP_PATH = must("ETG_DUMP_PATH");
 const ETG_LANGUAGE = must("ETG_LANGUAGE");
 const ETG_INVENTORY = must("ETG_INVENTORY");
 
-// IMPORTANT: Set this to your REAL upsert edge function URL, e.g.
-// https://<project>.supabase.co/functions/v1/ratehawk-hotels-batch-upsert
-const SUPABASE_FUNCTION_URL = must("SUPABASE_FUNCTION_URL");
+const SUPABASE_UPSERT_URL = must("SUPABASE_UPSERT_URL");
 
-// Optional (if your function requires auth)
+// Optional env
 const SYNC_API_TOKEN = process.env.SYNC_API_TOKEN || "";
-
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
 
-function upsertHeaders() {
-  const h = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-  };
+function jsonHeaders() {
+  const h = { "Content-Type": "application/json", "Accept": "application/json" };
   if (SYNC_API_TOKEN) h["Authorization"] = `Bearer ${SYNC_API_TOKEN}`;
   return h;
 }
@@ -42,30 +38,21 @@ async function getDumpUrlViaGateway() {
     headers: {
       "x-internal-token": ETG_GATEWAY_TOKEN,
       "Content-Type": "application/json",
-      "Accept": "application/json",
+      "Accept": "application/json"
     },
     body: JSON.stringify({
       target: ETG_TARGET,
       path: ETG_DUMP_PATH,
       options: {
         method: "POST",
-        body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY },
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-          "User-Agent": "exora-etg-worker (Render Cron)",
-        },
-      },
-    }),
+        body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY }
+      }
+    })
   });
 
   const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
 
   if (!res.ok || !json?.data?.url) {
     throw new Error(`Gateway failed (${res.status}): ${text}`);
@@ -75,82 +62,82 @@ async function getDumpUrlViaGateway() {
 }
 
 async function upsertBatch(download_id, hotels, batch_index) {
-  const res = await fetch(SUPABASE_FUNCTION_URL, {
+  const res = await fetch(SUPABASE_UPSERT_URL, {
     method: "POST",
-    headers: upsertHeaders(),
-    body: JSON.stringify({
-      download_id,
-      hotels,
-      batch_index,
-    }),
+    headers: jsonHeaders(),
+    body: JSON.stringify({ download_id, hotels, batch_index })
   });
 
   const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
 
-  if (!res.ok) {
+  if (!res.ok || (json && json.success === false)) {
     throw new Error(`Upsert failed (${res.status}): ${text}`);
   }
-  if (json && json.success === false) {
-    throw new Error(`Upsert returned success=false: ${text}`);
-  }
-
   return json;
 }
 
-async function fetchDumpStreamWithRetry(dumpUrl, retries = 1) {
-  let lastErr = null;
+// Checks first bytes for ZSTD frame magic: 28 B5 2F FD
+function zstdMagicGuard() {
+  let checked = false;
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    if (attempt > 0) console.log(`🔁 Retrying dump download (attempt ${attempt + 1})...`);
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      if (!checked) {
+        checked = true;
+        const b = chunk instanceof Buffer ? chunk : Buffer.from(chunk);
+        const hex = b.subarray(0, 8).toString("hex");
+        const magic = b.subarray(0, 4).toString("hex"); // expect 28b52ffd
 
-    try {
-      const dumpRes = await fetch(dumpUrl, {
-        method: "GET",
-        headers: { "Accept": "*/*" },
-      });
-
-      if (!dumpRes.ok) {
-        const body = await dumpRes.text().catch(() => "");
-        throw new Error(`Dump download failed (${dumpRes.status}): ${body}`);
+        if (magic !== "28b52ffd") {
+          cb(
+            new Error(
+              `Downloaded data is NOT raw .zst (magic=${magic}, first8=${hex}). ` +
+              `This usually means the URL returned HTML/JSON error OR HTTP compression changed the bytes.`
+            )
+          );
+          return;
+        }
       }
-
-      // Node 18+ fetch returns a Web ReadableStream. Convert it to Node stream:
-      if (!dumpRes.body) throw new Error("Dump response has no body stream");
-
-      const nodeReadable = Readable.fromWeb(dumpRes.body);
-      return nodeReadable;
-    } catch (e) {
-      lastErr = e;
+      cb(null, chunk);
     }
-  }
-
-  throw lastErr;
+  });
 }
 
 async function run() {
   console.log("🚀 Starting ETG sync");
   console.log("Inventory:", ETG_INVENTORY);
-  console.log("Batch size:", BATCH_SIZE);
 
   const download_id = `render-${Date.now()}`;
 
   const dumpUrl = await getDumpUrlViaGateway();
   console.log("📦 Got dump URL:", dumpUrl);
-  console.log("⬇️ Streaming + decompressing ZSTD (no full-file buffering)...");
 
-  // Stream download -> zstd stream -> readline
-  const dumpNodeStream = await fetchDumpStreamWithRetry(dumpUrl, 1);
-  const zstdStream = dumpNodeStream.pipe(createDecompressStream());
+  console.log("⬇️ Downloading dump (.zst)...");
+  const dumpRes = await fetch(dumpUrl, {
+    // CRITICAL: ensure we get the raw bytes, not gzip/br-decoded content
+    headers: { "Accept-Encoding": "identity" }
+  });
 
+  if (!dumpRes.ok) {
+    const t = await dumpRes.text();
+    throw new Error(`Dump download failed (${dumpRes.status}): ${t}`);
+  }
+  if (!dumpRes.body) throw new Error("Dump response has no body stream");
+
+  // Convert Web ReadableStream -> Node Readable
+  const nodeBody = Readable.fromWeb(dumpRes.body);
+
+  console.log("🔓 Decompressing ZSTD (streaming)...");
+  const decompressedStream = nodeBody
+    .pipe(zstdMagicGuard())
+    .pipe(createDecompressStream());
+
+  console.log("🧾 Parsing JSONL + uploading batches...");
   const rl = readline.createInterface({
-    input: zstdStream,
-    crlfDelay: Infinity,
+    input: decompressedStream,
+    crlfDelay: Infinity
   });
 
   let batch = [];
@@ -161,12 +148,7 @@ async function run() {
     if (!line || !line.trim()) continue;
 
     let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      // If any random bad line exists, skip it (safer than crashing whole job)
-      continue;
-    }
+    try { obj = JSON.parse(line); } catch { continue; }
 
     batch.push(obj);
 
