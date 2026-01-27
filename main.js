@@ -1,5 +1,5 @@
+import { spawn } from "node:child_process";
 import readline from "node:readline";
-import { decompress } from "fzstd";
 
 function must(name) {
   const v = process.env[name];
@@ -21,17 +21,12 @@ const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
 
 function jsonHeaders() {
-  const h = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-  };
+  const h = { "Content-Type": "application/json", "Accept": "application/json" };
   if (SYNC_API_TOKEN) h["Authorization"] = `Bearer ${SYNC_API_TOKEN}`;
   return h;
 }
 
 async function getDumpUrlViaGateway() {
-  console.log("🔐 Fetching dump URL via gateway...");
-
   const res = await fetch(`${ETG_GATEWAY_URL}/etg/proxy`, {
     method: "POST",
     headers: {
@@ -52,11 +47,7 @@ async function getDumpUrlViaGateway() {
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = null; }
-
-  if (!res.ok || !json?.data?.url) {
-    throw new Error(`Gateway failed (${res.status}): ${text}`);
-  }
-
+  if (!res.ok || !json?.data?.url) throw new Error(`Gateway failed (${res.status}): ${text}`);
   return json.data.url;
 }
 
@@ -66,15 +57,7 @@ async function upsertBatch(download_id, hotels, batch_index) {
     headers: jsonHeaders(),
     body: JSON.stringify({ download_id, hotels, batch_index }),
   });
-
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = null; }
-
-  if (!res.ok || (json && json.success === false)) {
-    throw new Error(`Upsert failed (${res.status}): ${text}`);
-  }
-  return json;
+  if (!res.ok) throw new Error(`Upsert failed: ${await res.text()}`);
 }
 
 async function run() {
@@ -83,24 +66,32 @@ async function run() {
 
   const download_id = `render-${Date.now()}`;
 
+  console.log("🔐 Fetching dump URL via gateway...");
   const dumpUrl = await getDumpUrlViaGateway();
   console.log("📦 Got dump URL:", dumpUrl);
 
-  console.log("⬇️ Downloading dump (.zst)...");
+  console.log("⬇️ Streaming dump download...");
   const dumpRes = await fetch(dumpUrl);
+
+  // IMPORTANT: ensure we got the file, not an error page
   if (!dumpRes.ok) {
-    throw new Error(`Dump download failed (${dumpRes.status}): ${await dumpRes.text()}`);
+    const t = await dumpRes.text();
+    throw new Error(`Dump download failed (${dumpRes.status}): ${t.slice(0, 500)}`);
   }
+  const ctype = dumpRes.headers.get("content-type") || "";
+  console.log("ℹ️ content-type:", ctype);
 
-  console.log("🔓 Decompressing ZSTD...");
-  const compressed = Buffer.from(await dumpRes.arrayBuffer());
-  const decompressed = decompress(compressed); // Uint8Array
+  console.log("🔓 Streaming zstd decompress...");
+  const zstd = spawn("zstd", ["-d", "-c"]);
 
-  console.log("🧾 Parsing JSONL + uploading batches...");
-  const rl = readline.createInterface({
-    input: decompressed.toString("utf8").split("\n")[Symbol.iterator](),
-    crlfDelay: Infinity,
+  dumpRes.body.pipe(zstd.stdin);
+
+  zstd.stderr.on("data", (d) => {
+    // zstd prints warnings/errors here
+    console.log("zstd:", d.toString().trim());
   });
+
+  const rl = readline.createInterface({ input: zstd.stdout, crlfDelay: Infinity });
 
   let batch = [];
   let total = 0;
@@ -111,7 +102,6 @@ async function run() {
 
     let obj;
     try { obj = JSON.parse(line); } catch { continue; }
-
     batch.push(obj);
 
     if (batch.length >= BATCH_SIZE) {
@@ -120,9 +110,7 @@ async function run() {
       batch = [];
       batchIndex++;
 
-      if (total % LOG_EVERY === 0) {
-        console.log(`✅ Upserted ${total}`);
-      }
+      if (total % LOG_EVERY === 0) console.log(`✅ Upserted ${total}`);
     }
   }
 
@@ -130,6 +118,10 @@ async function run() {
     await upsertBatch(download_id, batch, batchIndex);
     total += batch.length;
   }
+
+  // If zstd failed, it will exit non-zero
+  const code = await new Promise((resolve) => zstd.on("close", resolve));
+  if (code !== 0) throw new Error(`zstd exited with code ${code}`);
 
   console.log(`🎉 Done. Total processed: ${total}`);
 }
