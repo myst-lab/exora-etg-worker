@@ -1,5 +1,6 @@
 import readline from "node:readline";
-import { decompress } from "fzstd";
+import { Readable } from "node:stream";
+import { createDecompressStream } from "@mongodb-js/zstd";
 
 function must(name) {
   const v = process.env[name];
@@ -91,14 +92,20 @@ async function run() {
   if (!dumpRes.ok) {
     throw new Error(`Dump download failed (${dumpRes.status}): ${await dumpRes.text()}`);
   }
+  if (!dumpRes.body) {
+    throw new Error("Dump download failed: response body is empty");
+  }
 
-  console.log("🔓 Decompressing ZSTD...");
-  const compressed = Buffer.from(await dumpRes.arrayBuffer());
-  const decompressed = decompress(compressed); // Uint8Array
+  console.log("🔓 Decompressing ZSTD (streaming)...");
+  // Convert WHATWG ReadableStream -> Node Readable
+  const nodeReadable = Readable.fromWeb(dumpRes.body);
+
+  // Stream: compressed -> zstd decompress -> utf8 lines
+  const decompressedStream = nodeReadable.pipe(createDecompressStream());
 
   console.log("🧾 Parsing JSONL + uploading batches...");
   const rl = readline.createInterface({
-    input: decompressed.toString("utf8").split("\n")[Symbol.iterator](),
+    input: decompressedStream,
     crlfDelay: Infinity,
   });
 
