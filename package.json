@@ -1,8 +1,8 @@
 {
   "name": "exora-etg-worker",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
+  "private": true,
   "scripts": {
     "start": "node main.js"
   },
