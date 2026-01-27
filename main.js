@@ -1,12 +1,11 @@
-import { fetch } from "undici";
 import readline from "node:readline";
 import { createDecompressStream } from "@mongodb-js/zstd";
 
-function must(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
+const must = (k) => {
+  const v = process.env[k];
+  if (!v) throw new Error(`Missing env var: ${k}`);
   return v;
-}
+};
 
 const ETG_GATEWAY_URL = must("ETG_GATEWAY_URL");
 const ETG_GATEWAY_TOKEN = must("ETG_GATEWAY_TOKEN");
@@ -15,8 +14,8 @@ const ETG_DUMP_PATH = must("ETG_DUMP_PATH");
 const ETG_LANGUAGE = must("ETG_LANGUAGE");
 const ETG_INVENTORY = must("ETG_INVENTORY");
 
-const SUPABASE_UPSERT_URL = must("SUPABASE_UPSERT_URL");
-const SYNC_API_TOKEN = process.env.SYNC_API_TOKEN || null;
+const SUPABASE_FUNCTION_URL = must("SUPABASE_FUNCTION_URL");
+const SYNC_API_TOKEN = must("SYNC_API_TOKEN");
 
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
@@ -26,8 +25,7 @@ async function getDumpUrl() {
     method: "POST",
     headers: {
       "x-internal-token": ETG_GATEWAY_TOKEN,
-      "Content-Type": "application/json",
-      "Accept": "application/json"
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
       target: ETG_TARGET,
@@ -39,67 +37,47 @@ async function getDumpUrl() {
     })
   });
 
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch {}
-  if (!res.ok || !json?.data?.url) {
-    throw new Error(`Failed to get dump URL (${res.status}): ${text.slice(0, 300)}`);
-  }
+  const json = await res.json();
+  if (!json?.data?.url) throw new Error("Failed to get dump URL");
   return json.data.url;
 }
 
-async function upsertBatch(download_id, hotels, batch_index) {
-  const res = await fetch(SUPABASE_UPSERT_URL, {
+async function upsertBatch(hotels) {
+  const res = await fetch(SUPABASE_FUNCTION_URL, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      ...(SYNC_API_TOKEN ? { Authorization: `Bearer ${SYNC_API_TOKEN}` } : {})
+      Authorization: `Bearer ${SYNC_API_TOKEN}`,
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify({ download_id, hotels, batch_index })
+    body: JSON.stringify({ hotels })
   });
 
-  if (!res.ok) {
-    throw new Error(`Upsert failed: ${await res.text()}`);
-  }
+  if (!res.ok) throw new Error(await res.text());
 }
 
 async function run() {
   console.log("🚀 Starting ETG sync");
-  console.log("Inventory:", ETG_INVENTORY);
 
-  const download_id = `render-${Date.now()}`;
-
-  console.log("🔐 Fetching dump URL...");
   const dumpUrl = await getDumpUrl();
-  console.log("📦 Dump URL:", dumpUrl);
+  console.log("📦 Got dump URL");
 
   const res = await fetch(dumpUrl);
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Dump download failed (${res.status}): ${t.slice(0, 300)}`);
-  }
-
-  console.log("🔓 Streaming ZSTD decompression...");
-  const decompressed = res.body.pipe(createDecompressStream());
 
   const rl = readline.createInterface({
-    input: decompressed,
+    input: res.body.pipe(createDecompressStream()),
     crlfDelay: Infinity
   });
 
   let batch = [];
   let total = 0;
-  let batchIndex = 0;
 
   for await (const line of rl) {
-    if (!line?.trim()) continue;
+    if (!line) continue;
 
-    let obj;
-    try { obj = JSON.parse(line); } catch { continue; }
-    batch.push(obj);
+    batch.push(JSON.parse(line));
 
     if (batch.length >= BATCH_SIZE) {
-      await upsertBatch(download_id, batch, batchIndex++);
+      await upsertBatch(batch);
       total += batch.length;
       batch = [];
 
@@ -110,11 +88,11 @@ async function run() {
   }
 
   if (batch.length) {
-    await upsertBatch(download_id, batch, batchIndex);
+    await upsertBatch(batch);
     total += batch.length;
   }
 
-  console.log(`🎉 Done. Total processed: ${total}`);
+  console.log(`🎉 Done. Total hotels: ${total}`);
 }
 
 run().catch(err => {
