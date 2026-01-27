@@ -21,10 +21,7 @@ const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
 
 function jsonHeaders() {
-  const h = {
-    "Content-Type": "application/json",
-    "Accept": "application/json"
-  };
+  const h = { "Content-Type": "application/json", "Accept": "application/json" };
   if (SYNC_API_TOKEN) h["Authorization"] = `Bearer ${SYNC_API_TOKEN}`;
   return h;
 }
@@ -45,17 +42,14 @@ async function getDumpUrlViaGateway() {
       options: {
         method: "POST",
         body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY },
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json"
-        }
+        headers: { "Content-Type": "application/json", "Accept": "application/json" }
       }
     })
   });
 
   const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = null; }
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
 
   if (!res.ok || !json?.data?.url) {
     throw new Error(`Gateway failed (${res.status}): ${text.slice(0, 1200)}`);
@@ -98,27 +92,12 @@ async function run() {
     throw new Error(`Dump download failed (${dumpRes.status}): ${preview.slice(0, 1200)}`);
   }
 
-  const ct = (dumpRes.headers.get("content-type") || "").toLowerCase();
-  if (ct.includes("text/html") || ct.includes("application/xml") || ct.includes("text/xml")) {
-    const preview = await dumpRes.text().catch(() => "");
-    throw new Error(
-      `Dump URL returned HTML/XML not zstd (content-type=${ct}).\n` +
-      `Preview:\n${preview.slice(0, 1200)}`
-    );
-  }
-
-  if (!dumpRes.body) {
-    throw new Error("Dump response has no body stream (unexpected).");
-  }
-
   console.log("🔓 Decompressing ZSTD (streaming)...");
-  const zstdStream = dumpRes.body.pipe(createDecompressStream());
+  if (!dumpRes.body) throw new Error("Dump response has no body stream.");
+  const decompressedStream = dumpRes.body.pipe(createDecompressStream());
 
   console.log("🧾 Parsing JSONL + uploading batches...");
-  const rl = readline.createInterface({
-    input: zstdStream,
-    crlfDelay: Infinity
-  });
+  const rl = readline.createInterface({ input: decompressedStream, crlfDelay: Infinity });
 
   let batch = [];
   let total = 0;
@@ -137,9 +116,7 @@ async function run() {
       total += batch.length;
       batch = [];
 
-      if (total % LOG_EVERY === 0) {
-        console.log(`✅ Upserted ${total}`);
-      }
+      if (total % LOG_EVERY === 0) console.log(`✅ Upserted ${total}`);
     }
   }
 
