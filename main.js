@@ -1,10 +1,5 @@
 import readline from "node:readline";
-import { createDecompressStream } from "@mongodb-js/zstd";
-
-/**
- * Node 18+ has global fetch
- * DO NOT import fetch from undici
- */
+import { decompress } from "fzstd";
 
 function must(name) {
   const v = process.env[name];
@@ -13,72 +8,112 @@ function must(name) {
 }
 
 // ===== ENV =====
-const ETG_GATEWAY_URL = must("ETG_GATEWAY_URL");
-const ETG_GATEWAY_TOKEN = must("ETG_GATEWAY_TOKEN");
-const ETG_TARGET = must("ETG_TARGET");
-const ETG_DUMP_PATH = must("ETG_DUMP_PATH");
-const ETG_LANGUAGE = must("ETG_LANGUAGE");
-const ETG_INVENTORY = must("ETG_INVENTORY");
+const ETG_GATEWAY_URL = must("ETG_GATEWAY_URL");       // http://35.195.210.59:8080
+const ETG_GATEWAY_TOKEN = must("ETG_GATEWAY_TOKEN");   // secret
+const ETG_TARGET = must("ETG_TARGET");                 // sandbox
+const ETG_DUMP_PATH = must("ETG_DUMP_PATH");           // hotel/info/dump/
+const ETG_LANGUAGE = must("ETG_LANGUAGE");             // en
+const ETG_INVENTORY = must("ETG_INVENTORY");           // direct_fast or all
 
-const SUPABASE_FUNCTION_URL = must("SUPABASE_FUNCTION_URL");
-const SYNC_API_TOKEN = must("SYNC_API_TOKEN");
+// Use existing deployed function:
+const SUPABASE_UPSERT_URL = must("SUPABASE_UPSERT_URL"); // .../functions/v1/ratehawk-hotels-batch-upsert
+
+// Optional: only if your function requires auth (many are verify_jwt=false)
+const SYNC_API_TOKEN = process.env.SYNC_API_TOKEN || null;
 
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
 
-// ===== STEP 1: GET DUMP URL =====
-async function getDumpUrl() {
+// ===== Helpers =====
+async function getDumpUrlViaGateway() {
   console.log("🔐 Fetching dump URL via gateway...");
 
   const res = await fetch(`${ETG_GATEWAY_URL}/etg/proxy`, {
     method: "POST",
     headers: {
       "x-internal-token": ETG_GATEWAY_TOKEN,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      "Accept": "application/json"
     },
     body: JSON.stringify({
       target: ETG_TARGET,
       path: ETG_DUMP_PATH,
       options: {
         method: "POST",
-        body: {
-          language: ETG_LANGUAGE,
-          inventory: ETG_INVENTORY
-        }
+        body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY }
       }
     })
   });
 
-  const json = await res.json();
-  if (!json?.data?.url) {
-    throw new Error("Failed to obtain dump URL");
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = {}; }
+
+  if (!res.ok || !json?.data?.url) {
+    throw new Error(`Gateway failed (${res.status}): ${text}`);
   }
 
   return json.data.url;
 }
 
-// ===== STEP 2: UPSERT BATCH =====
-async function upsertBatch(hotels) {
-  const res = await fetch(SUPABASE_FUNCTION_URL, {
+function headersJson() {
+  const h = {
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+  };
+  if (SYNC_API_TOKEN) h["Authorization"] = `Bearer ${SYNC_API_TOKEN}`;
+  return h;
+}
+
+async function upsertBatch(download_id, hotels, batch_index) {
+  const res = await fetch(SUPABASE_UPSERT_URL, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${SYNC_API_TOKEN}`,
-      "Content-Type": "application/json"
-    },
+    headers: headersJson(),
     body: JSON.stringify({
-      hotels
+      download_id,
+      hotels,
+      batch_index
     })
   });
 
-  if (!res.ok) {
-    throw new Error(await res.text());
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = {}; }
+
+  if (!res.ok || json?.success === false) {
+    throw new Error(`Upsert failed (${res.status}): ${text}`);
   }
+  return json;
 }
 
-// ===== MAIN =====
+// ===== Main =====
 async function run() {
-  console.log("🚀 Starting ETG sync");
+  console.log("🚀 Starting ETG sync...");
+  console.log("Inventory:", ETG_INVENTORY);
 
-  const dumpUrl = await getDumpUrl();
-  console.log("📦 Dump URL acquired");
-  c
+  // If your upsert function requires download_id tracking, use a simple id:
+  // (ratehawk-dump-url would generate one, but this works if it’s optional)
+  const download_id = `render-${Date.now()}`;
+
+  const dumpUrl = await getDumpUrlViaGateway();
+  console.log("📦 Got dump URL:", dumpUrl);
+
+  console.log("⬇️ Downloading dump (.zst)...");
+  const dumpRes = await fetch(dumpUrl);
+  if (!dumpRes.ok) throw new Error(`Dump download failed: ${dumpRes.status} ${await dumpRes.text()}`);
+
+  console.log("🔓 Decompressing ZSTD...");
+  const compressed = Buffer.from(await dumpRes.arrayBuffer());
+  const decompressed = decompress(compressed); // Uint8Array
+
+  console.log("🧾 Parsing JSONL + uploading batches...");
+  const rl = readline.createInterface({
+    input: decompressed.toString("utf8").split("\n")[Symbol.iterator](),
+    crlfDelay: Infinity
+  });
+
+  let batch = [];
+  let total = 0;
+  let batchIndex = 0;
+
+  for await (cons
