@@ -1,12 +1,15 @@
 {
   "name": "exora-etg-worker",
   "version": "1.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
   "scripts": {
     "start": "node main.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "@mongodb-js/zstd": "^1.2.4"
+    "@mongodb-js/zstd": "1.2.4"
   }
 }
