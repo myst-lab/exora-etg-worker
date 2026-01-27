@@ -1,117 +1,124 @@
-import { createDecompressStream } from "@mongodb-js/zstd";
 import readline from "node:readline";
-import { Readable } from "node:stream";
+import { decompress } from "fzstd";
 
-const must = (k) => {
-  const v = process.env[k];
-  if (!v) throw new Error(`Missing env var: ${k}`);
+function must(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
-};
+}
 
-// ETG Gateway
-const ETG_GATEWAY_URL = must("ETG_GATEWAY_URL");       // e.g. http://35.195.210.59:8080
-const ETG_GATEWAY_TOKEN = must("ETG_GATEWAY_TOKEN");   // x-internal-token
-const ETG_TARGET = must("ETG_TARGET");                 // usually "sandbox" per your gateway mapping
-const ETG_DUMP_PATH = must("ETG_DUMP_PATH");           // e.g. "hotel/info/dump/"
-const ETG_LANGUAGE = must("ETG_LANGUAGE");             // "en"
-const ETG_INVENTORY = must("ETG_INVENTORY");           // "all" or "direct_fast"
+const ETG_GATEWAY_URL = must("ETG_GATEWAY_URL");
+const ETG_GATEWAY_TOKEN = must("ETG_GATEWAY_TOKEN");
+const ETG_TARGET = must("ETG_TARGET");
+const ETG_DUMP_PATH = must("ETG_DUMP_PATH");
+const ETG_LANGUAGE = must("ETG_LANGUAGE");
+const ETG_INVENTORY = must("ETG_INVENTORY");
 
-// Supabase Edge Function (existing function)
-const SUPABASE_FUNCTION_URL = must("SUPABASE_FUNCTION_URL"); // FULL endpoint to upsert function
-// e.g. https://xxxxx.supabase.co/functions/v1/ratehawk-hotels-batch-upsert
+const SUPABASE_UPSERT_URL = must("SUPABASE_UPSERT_URL");
+const SYNC_API_TOKEN = process.env.SYNC_API_TOKEN || null;
 
-// Optional auth (only used if your function expects it)
-const SYNC_API_TOKEN = process.env.SYNC_API_TOKEN || "";
-
-// Batching
-const BATCH_SIZE = Number(process.env.BATCH_SIZE || 200);     // start smaller, increase later
+const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
 
-// Helper: convert Web stream -> Node stream (required for zstd stream)
-function toNodeReadable(webStream) {
-  // Node 18+ supports this
-  return Readable.fromWeb(webStream);
+function jsonHeaders() {
+  const h = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+  };
+  if (SYNC_API_TOKEN) h["Authorization"] = `Bearer ${SYNC_API_TOKEN}`;
+  return h;
 }
 
 async function getDumpUrlViaGateway() {
+  console.log("🔐 Fetching dump URL via gateway...");
+
   const res = await fetch(`${ETG_GATEWAY_URL}/etg/proxy`, {
     method: "POST",
     headers: {
       "x-internal-token": ETG_GATEWAY_TOKEN,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      "Accept": "application/json",
     },
     body: JSON.stringify({
       target: ETG_TARGET,
       path: ETG_DUMP_PATH,
       options: {
         method: "POST",
-        body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY }
-      }
-    })
+        body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY },
+      },
+    }),
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`Gateway error ${res.status}: ${text}`);
+  let json;
+  try { json = JSON.parse(text); } catch { json = null; }
 
-  const json = JSON.parse(text);
-  const url = json?.data?.url;
-  if (!url) throw new Error(`No dump url in gateway response: ${text}`);
-  return url;
+  if (!res.ok || !json?.data?.url) {
+    throw new Error(`Gateway failed (${res.status}): ${text}`);
+  }
+
+  return json.data.url;
 }
 
-async function upsertBatch(hotels, meta = {}) {
-  const headers = { "Content-Type": "application/json" };
-  if (SYNC_API_TOKEN) headers["Authorization"] = `Bearer ${SYNC_API_TOKEN}`;
-
-  const res = await fetch(SUPABASE_FUNCTION_URL, {
+async function upsertBatch(download_id, hotels, batch_index) {
+  const res = await fetch(SUPABASE_UPSERT_URL, {
     method: "POST",
-    headers,
-    body: JSON.stringify({ hotels, ...meta })
+    headers: jsonHeaders(),
+    body: JSON.stringify({ download_id, hotels, batch_index }),
   });
 
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Upsert failed ${res.status}: ${t}`);
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = null; }
+
+  if (!res.ok || (json && json.success === false)) {
+    throw new Error(`Upsert failed (${res.status}): ${text}`);
   }
+  return json;
 }
 
 async function run() {
-  console.log("🚀 Starting ETG sync…");
-  console.log(`Inventory: ${ETG_INVENTORY}`);
+  console.log("🚀 Starting ETG sync");
+  console.log("Inventory:", ETG_INVENTORY);
 
-  console.log("🔑 Fetching dump URL via gateway…");
+  const download_id = `render-${Date.now()}`;
+
   const dumpUrl = await getDumpUrlViaGateway();
   console.log("📦 Got dump URL:", dumpUrl);
 
-  console.log("⬇️ Downloading dump (.zst)…");
-  const res = await fetch(dumpUrl);
-  if (!res.ok || !res.body) {
-    throw new Error(`Dump download failed ${res.status}`);
+  console.log("⬇️ Downloading dump (.zst)...");
+  const dumpRes = await fetch(dumpUrl);
+  if (!dumpRes.ok) {
+    throw new Error(`Dump download failed (${dumpRes.status}): ${await dumpRes.text()}`);
   }
 
-  console.log("🔓 Decompressing ZSTD (stream)…");
-  const nodeReadable = toNodeReadable(res.body);
-  const zstdStream = nodeReadable.pipe(createDecompressStream());
+  console.log("🔓 Decompressing ZSTD...");
+  const compressed = Buffer.from(await dumpRes.arrayBuffer());
+  const decompressed = decompress(compressed); // Uint8Array
 
+  console.log("🧾 Parsing JSONL + uploading batches...");
   const rl = readline.createInterface({
-    input: zstdStream,
-    crlfDelay: Infinity
+    input: decompressed.toString("utf8").split("\n")[Symbol.iterator](),
+    crlfDelay: Infinity,
   });
 
   let batch = [];
   let total = 0;
+  let batchIndex = 0;
 
   for await (const line of rl) {
-    if (!line) continue;
+    if (!line || !line.trim()) continue;
 
-    // Each line should be JSON object
-    const obj = JSON.parse(line);
+    let obj;
+    try { obj = JSON.parse(line); } catch { continue; }
+
     batch.push(obj);
 
     if (batch.length >= BATCH_SIZE) {
-      await upsertBatch(batch, { inventory: ETG_INVENTORY });
+      await upsertBatch(download_id, batch, batchIndex);
       total += batch.length;
       batch = [];
+      batchIndex++;
 
       if (total % LOG_EVERY === 0) {
         console.log(`✅ Upserted ${total}`);
@@ -120,14 +127,14 @@ async function run() {
   }
 
   if (batch.length) {
-    await upsertBatch(batch, { inventory: ETG_INVENTORY });
+    await upsertBatch(download_id, batch, batchIndex);
     total += batch.length;
   }
 
-  console.log(`🎉 Done. Total hotels: ${total}`);
+  console.log(`🎉 Done. Total processed: ${total}`);
 }
 
 run().catch((err) => {
-  console.error("❌ Fatal error:", err?.stack || err?.message || err);
+  console.error("❌ Fatal error:", err);
   process.exit(1);
 });
