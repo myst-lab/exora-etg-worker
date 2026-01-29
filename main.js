@@ -15,13 +15,18 @@ const ETG_DUMP_PATH = must("ETG_DUMP_PATH");
 const ETG_LANGUAGE = must("ETG_LANGUAGE");
 const ETG_INVENTORY = must("ETG_INVENTORY");
 
-const SUPABASE_UPSERT_URL = must("SUPABASE_UPSERT_URL"); // e.g. .../ratehawk-hotels-batch-upsert
+const SUPABASE_UPSERT_URL = must("SUPABASE_UPSERT_URL"); // e.g. https://<project-ref>.supabase.co/functions/v1/ratehawk-hotels-batch-upsert
 const SYNC_API_TOKEN = process.env.SYNC_API_TOKEN || null;
 
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const LOG_EVERY = Number(process.env.LOG_EVERY || 5000);
 const UPSERT_RETRIES = Number(process.env.UPSERT_RETRIES || 5);
 const UPSERT_RETRY_MS = Number(process.env.UPSERT_RETRY_MS || 1500);
+
+// Filter rules (can override via Render env vars)
+const MIN_IMAGES = Number(process.env.MIN_IMAGES || 1); // require at least this many images
+const MIN_STAR_RATING = Number(process.env.MIN_STAR_RATING || 3); // remove 0/1/2 stars + no-stars
+const REQUIRE_GEO = (process.env.REQUIRE_GEO || "1") !== "0"; // require latitude/longitude
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -30,7 +35,7 @@ function sleep(ms) {
 function jsonHeaders() {
   const h = {
     "Content-Type": "application/json",
-    "Accept": "application/json"
+    "Accept": "application/json",
   };
   if (SYNC_API_TOKEN) h["Authorization"] = `Bearer ${SYNC_API_TOKEN}`;
   return h;
@@ -44,21 +49,25 @@ async function getDumpUrlViaGateway() {
     headers: {
       "x-internal-token": ETG_GATEWAY_TOKEN,
       "Content-Type": "application/json",
-      "Accept": "application/json"
+      "Accept": "application/json",
     },
     body: JSON.stringify({
       target: ETG_TARGET,
       path: ETG_DUMP_PATH,
       options: {
         method: "POST",
-        body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY }
-      }
-    })
+        body: { language: ETG_LANGUAGE, inventory: ETG_INVENTORY },
+      },
+    }),
   });
 
   const text = await res.text();
   let json;
-  try { json = JSON.parse(text); } catch { json = null; }
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = null;
+  }
 
   if (!res.ok || !json?.data?.url) {
     throw new Error(`Gateway failed (${res.status}): ${text}`);
@@ -74,16 +83,19 @@ async function upsertBatch(download_id, hotels, batch_index) {
     const res = await fetch(SUPABASE_UPSERT_URL, {
       method: "POST",
       headers: jsonHeaders(),
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
     const text = await res.text();
     let json;
-    try { json = JSON.parse(text); } catch { json = null; }
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
 
     if (res.ok && (!json || json.success !== false)) return json;
 
-    // Retry on common transient statuses
     const retryable = [408, 429, 500, 502, 503, 504].includes(res.status);
     const msg = `Upsert failed (${res.status}) attempt ${attempt}/${UPSERT_RETRIES}: ${text}`;
 
@@ -98,12 +110,64 @@ async function upsertBatch(download_id, hotels, batch_index) {
 
 function looksLikeZstdMagic(buf) {
   // ZSTD frame magic number (little-endian): 28 B5 2F FD
-  return buf?.length >= 4 && buf[0] === 0x28 && buf[1] === 0xB5 && buf[2] === 0x2F && buf[3] === 0xFD;
+  return (
+    buf?.length >= 4 &&
+    buf[0] === 0x28 &&
+    buf[1] === 0xb5 &&
+    buf[2] === 0x2f &&
+    buf[3] === 0xfd
+  );
 }
+
+// ---------- FILTER: keep only “good” hotels ----------
+function toNumber(x) {
+  const n = typeof x === "number" ? x : Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function validImageUrls(images) {
+  if (!Array.isArray(images)) return [];
+  return images
+    .map((u) => (typeof u === "string" ? u.trim() : ""))
+    .filter((u) => u.startsWith("http://") || u.startsWith("https://"));
+}
+
+function isValidHotel(h) {
+  // Must have id + name
+  if (!h || typeof h !== "object") return false;
+  if (typeof h.id !== "string" || !h.id.trim()) return false;
+  if (typeof h.name !== "string" || h.name.trim().length < 2) return false;
+
+  // Must have stars: remove no-stars + 1–2 stars
+  const sr = toNumber(h.star_rating);
+  if (sr === null) return false;
+  if (sr < MIN_STAR_RATING) return false;
+
+  // Must have images
+  const imgs = validImageUrls(h.images);
+  if (imgs.length < MIN_IMAGES) return false;
+
+  // Must have valid geo (optional)
+  if (REQUIRE_GEO) {
+    const lat = toNumber(h.latitude);
+    const lng = toNumber(h.longitude);
+    if (lat === null || lng === null) return false;
+    if (lat < -90 || lat > 90) return false;
+    if (lng < -180 || lng > 180) return false;
+  }
+
+  return true;
+}
+// -----------------------------------------------------
 
 async function run() {
   console.log("🚀 Starting ETG sync");
   console.log("Inventory:", ETG_INVENTORY);
+  console.log("Filters:", {
+    MIN_IMAGES,
+    MIN_STAR_RATING,
+    REQUIRE_GEO,
+  });
 
   const download_id = `render-${Date.now()}`;
 
@@ -112,8 +176,7 @@ async function run() {
 
   console.log("⬇️ Downloading dump (.zst) ...");
   const dumpRes = await fetch(dumpUrl, {
-    // Important: avoid accidental content-encoding transforms
-    headers: { "Accept-Encoding": "identity" }
+    headers: { "Accept-Encoding": "identity" },
   });
 
   if (!dumpRes.ok) {
@@ -121,8 +184,7 @@ async function run() {
     throw new Error(`Dump download failed (${dumpRes.status}): ${t}`);
   }
 
-  // Quick sanity check to catch "expired signed URL returns HTML" (common cause of "invalid zstd data")
-  // We read the first chunk from the Web stream, check magic bytes, then prepend it back into a Node stream.
+  // Sanity check for ZSTD magic (avoid HTML error page)
   const reader = dumpRes.body.getReader();
   const first = await reader.read();
   if (first.done || !first.value) {
@@ -131,11 +193,10 @@ async function run() {
 
   const firstBuf = Buffer.from(first.value);
   if (!looksLikeZstdMagic(firstBuf)) {
-    // likely HTML/XML error response
     const preview = firstBuf.toString("utf8", 0, Math.min(firstBuf.length, 300));
     throw new Error(
       "Downloaded data is not ZSTD (magic mismatch). Most likely the signed URL returned an error page.\n" +
-      `Preview:\n${preview}`
+        `Preview:\n${preview}`
     );
   }
 
@@ -151,7 +212,7 @@ async function run() {
         }
         controller.close();
       })().catch((err) => controller.error(err));
-    }
+    },
   });
 
   const compressedNode = Readable.fromWeb(rebuiltWebStream);
@@ -162,12 +223,15 @@ async function run() {
 
   const rl = readline.createInterface({
     input: decompressed,
-    crlfDelay: Infinity
+    crlfDelay: Infinity,
   });
 
-  console.log("🧾 Parsing JSONL + uploading batches...");
+  console.log("🧾 Parsing JSONL + filtering + uploading batches...");
+
   let batch = [];
-  let total = 0;
+  let totalUpserted = 0;
+  let totalSeen = 0;
+  let totalSkipped = 0;
   let batchIndex = 0;
 
   for await (const line of rl) {
@@ -177,29 +241,48 @@ async function run() {
     try {
       obj = JSON.parse(line);
     } catch {
-      // skip malformed lines instead of dying
+      totalSkipped++;
       continue;
     }
+
+    totalSeen++;
+
+    if (!isValidHotel(obj)) {
+      totalSkipped++;
+      continue;
+    }
+
+    // normalize images (keep only valid urls)
+    obj.images = validImageUrls(obj.images);
 
     batch.push(obj);
 
     if (batch.length >= BATCH_SIZE) {
-      rl.pause(); // prevent readline buffering tons of lines while we await network
+      rl.pause();
       await upsertBatch(download_id, batch, batchIndex);
-      total += batch.length;
+
+      totalUpserted += batch.length;
       batch = [];
       batchIndex++;
-      if (total % LOG_EVERY === 0) console.log(`✅ Upserted ${total}`);
+
+      if (totalUpserted % LOG_EVERY === 0) {
+        console.log(
+          `✅ Upserted ${totalUpserted} | seen ${totalSeen} | skipped ${totalSkipped}`
+        );
+      }
       rl.resume();
     }
   }
 
   if (batch.length) {
     await upsertBatch(download_id, batch, batchIndex);
-    total += batch.length;
+    totalUpserted += batch.length;
   }
 
-  console.log(`🎉 Done. Total processed: ${total}`);
+  console.log("🎉 Done.");
+  console.log(`Total seen: ${totalSeen}`);
+  console.log(`Total upserted: ${totalUpserted}`);
+  console.log(`Total skipped: ${totalSkipped}`);
 }
 
 run().catch((err) => {
